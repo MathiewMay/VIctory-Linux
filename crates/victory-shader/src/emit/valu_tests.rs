@@ -149,6 +149,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         stride_table: lowered.stride_table,
+        root_uavs: lowered.root_uavs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -194,12 +195,32 @@ fn run_cases(
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
+            let mut roots = vec![(0, Root::Constants(ud))];
+            if shader.stride_table {
+                // The heap view below is raw: its slot's entry points at the
+                // view itself (tbuffer format loads read it through the
+                // runtime table).
+                let param = 1
+                    + (shader.root_cbvs.len() + shader.root_srvs.len() + shader.root_uavs.len())
+                        as u32;
+                let entry = super::StrideEntry {
+                    stride: 4,
+                    ..Default::default()
+                };
+                roots.push((
+                    param,
+                    Root::View {
+                        srv: true,
+                        data: entry.words().to_vec(),
+                    },
+                ));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots,
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],

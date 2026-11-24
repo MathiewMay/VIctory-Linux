@@ -101,7 +101,9 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -848,6 +850,900 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
+    /// A compute program over a table at `s4` (user data dwords `s0..s3`
+    /// before it), with the resources shader analysis found there: `used`
+    /// entries of (kind, table dword, element stride). A stride of 0 is one
+    /// it did not recover.
+    fn table_program(
+        words: &[u32],
+        used: &[(crate::ResourceType, u32, u32)],
+        compute: crate::native::ComputeIo,
+    ) -> super::lower::Lowered {
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: used
+                .iter()
+                .map(|&(kind, table_offset_dwords, stride)| crate::UsedResource {
+                    kind,
+                    root: crate::RootType::Table,
+                    table_offset_dwords,
+                    lower_bound: 0,
+                    stride,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                })
+                .collect(),
+            io: crate::native::StageIo::Cs(compute),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        #[cfg(windows)]
+        let mut l = l;
+        assert!(l.stride_table);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil).unwrap();
+        }
+        l
+    }
+
+    /// A compute program with an unknown-stride shader view at table dword 0
+    /// and an unknown-stride unordered access view at table dword `uav`.
+    fn unknown_stride_program(
+        words: &[u32],
+        uav: u32,
+        compute: crate::native::ComputeIo,
+    ) -> super::lower::Lowered {
+        table_program(
+            words,
+            &[
+                (crate::ResourceType::Srv, 0, 0),
+                (crate::ResourceType::Uav, uav, 0),
+            ],
+            compute,
+        )
+    }
+
+    /// One thread, user SGPRs `s0..s4`.
+    const ONE_THREAD: crate::native::ComputeIo = crate::native::ComputeIo {
+        rsrc2: 5 << 1,
+        threads: [1, 1, 1],
+    };
+
+    #[cfg(windows)]
+    fn compute_shader(l: super::lower::Lowered) -> super::HostShader {
+        super::HostShader {
+            stage: super::HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            stride_table: l.stride_table,
+            root_uavs: l.root_uavs,
+        }
+    }
+
+    /// Held while a test here dispatches: two GPU tests at once on WARP can
+    /// end the test process with an access violation (see
+    /// `valu_tests::ONE_AT_A_TIME`).
+    #[cfg(windows)]
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The hardware adapter and WARP, those there are.
+    #[cfg(windows)]
+    fn hosts() -> Vec<(&'static str, super::host::Host)> {
+        [("the default adapter", false), ("WARP", true)]
+            .into_iter()
+            .filter_map(|(name, warp)| Some((name, super::host::Host::new(warp).ok()?)))
+            .collect()
+    }
+
+    /// What the GPU side makes for a buffer view of `count` elements of
+    /// `stride` bytes from element `first` of the buffer in heap slot `of`:
+    /// the raw view of those bytes (to go in heap slot `raw_slot`) and the
+    /// slot's runtime stride table entry.
+    #[cfg(windows)]
+    fn raw_view_of(
+        of: usize,
+        raw_slot: u32,
+        (first, count, stride): (u32, u32, u32),
+    ) -> (super::host::View<'static>, super::StrideEntry) {
+        let window = super::RawWindow::covering(
+            u64::from(first * stride),
+            u64::from(count * stride),
+        )
+        .unwrap();
+        (
+            super::host::View::RawAlias {
+                of,
+                first: window.first as u32,
+                dwords: window.dwords,
+            },
+            super::StrideEntry {
+                stride,
+                raw_slot: Some(raw_slot),
+                bias: window.bias,
+            },
+        )
+    }
+
+    /// A buffer read without a stride known at translation reads the bytes
+    /// the console reads, whatever view the title put in the slot: raw,
+    /// structured of any stride, or typed. The shader reads the raw view the
+    /// runtime stride table names for the slot (the slot itself for a raw
+    /// one), never the slot's own view through a handle of another kind,
+    /// which the RTX 5070 answers with other dwords than WARP and a Radeon
+    /// (121 for the 107 of the structured view of 12 bytes below).
+    ///
+    /// Checked for every kind on `host`: a load, a store and atomics.
+    #[cfg(windows)]
+    fn unknown_stride_views_read_their_bytes(name: &str, host: &super::host::Host) {
+        use super::StrideEntry;
+        use super::host::{Dispatch, Root, Stride, View};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E06_028A, // v_mov_b32 v3, 10
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let cs = compute_shader(unknown_stride_program(words, 8, ONE_THREAD));
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let data: Vec<u32> = (100..164).collect();
+        // The view in the slot, its stride, and the elements it has of the
+        // buffer (first, count); none: a raw view, read in its own slot.
+        let kinds = [
+            ("raw", Stride::Raw, 4, None),
+            // (The console's descriptor carries a stride for raw views too.)
+            ("raw, stride 12", Stride::Raw, 12, None),
+            ("structured 12", Stride::Structured(12), 12, Some((0, 21))),
+            ("structured 16", Stride::Structured(16), 16, Some((0, 16))),
+            ("structured 20", Stride::Structured(20), 20, Some((0, 12))),
+            ("typed RGBA32F", Stride::Typed, 16, Some((0, 16))),
+            (
+                "typed R32_UINT",
+                Stride::Format(DXGI_FORMAT_R32_UINT, 4),
+                4,
+                Some((0, 64)),
+            ),
+            // Views starting 4 and 12 bytes into their raw views.
+            (
+                "structured 12 from element 3",
+                Stride::Structured(12),
+                12,
+                Some((3, 10)),
+            ),
+            (
+                "structured 20 from element 3",
+                Stride::Structured(20),
+                20,
+                Some((3, 6)),
+            ),
+        ];
+        for (kind, view, stride, elements) in kinds {
+            // Heap: the shader view, the unordered one, their raw views.
+            let mut views = vec![
+                View::Buffer {
+                    data: &data,
+                    stride: view,
+                },
+                View::BufferUav(64, view),
+            ];
+            let mut table = Vec::new();
+            for slot in 0..2 {
+                let entry = match elements {
+                    Some((first, count)) => {
+                        let (raw, entry) = raw_view_of(slot, 2 + slot as u32, (first, count, stride));
+                        views.push(raw);
+                        entry
+                    }
+                    None => StrideEntry {
+                        stride,
+                        ..StrideEntry::default()
+                    },
+                };
+                table.extend(entry.words());
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table,
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let first = elements.map_or(0, |e| e.0);
+            let at = |index: u32, off: u32| (((first + index) * stride + off) / 4) as usize;
+            // The load of [2, 4], stored at [1, 8]; 10 added twice at [2, 0].
+            let mut want = vec![0; 64];
+            want[at(1, 8)] = data[at(2, 4)];
+            want[at(2, 0)] = 20;
+            assert_eq!(out[0], want, "{kind} on {name}");
+        }
+    }
+
+    #[test]
+    fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
+        // Translated and validated on every host; run where there is a GPU.
+        let _ = unknown_stride_program(
+            &[
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0x7E00_0282, // v_mov_b32 v0, 2
+                0x7E02_0284, // v_mov_b32 v1, 4
+                0xE030_3000,
+                0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+                0xBF81_0000, // s_endpgm
+            ],
+            8,
+            ONE_THREAD,
+        );
+        #[cfg(windows)]
+        let _one = one_at_a_time();
+        #[cfg(windows)]
+        for (name, host) in hosts() {
+            unknown_stride_views_read_their_bytes(name, &host);
+        }
+    }
+
+    /// The heap slot of an unknown-stride read loaded from a buffer at run
+    /// time, per thread group: each group's lanes read the bytes of the
+    /// view in the slot their group chose (a structured view of 12 bytes in
+    /// one, of 16 in the other), since the table entry is looked up by the
+    /// same computed slot the handle is made from. A lane reading past the
+    /// chosen view's elements reads zero, not the buffer's next bytes: the
+    /// raw view ends where the view does.
+    #[test]
+    fn unknown_stride_views_chosen_by_a_loaded_heap_index() {
+        let words: &[u32] = &[
+            0xBE94_0304, // s_mov_b32 s20, s4
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xF408_040A,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
+            0x8F07_8205, // s_lshl_b32 s7, s5, 2
+            0xF420_0188,
+            0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
+            0x8F06_8506, // s_lshl_b32 s6, s6, 5
+            0xF408_020A,
+            0x0C00_0000, // s_load_dwordx4 s[8:11], s[20:21], s6
+            0xF408_030A,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x8F07_8405, // s_lshl_b32 s7, s5, 4
+            0x7E02_0207, // v_mov_b32 v1, s7
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        // Four threads (v0: the thread's id), the group's id in s5 after
+        // the user SGPRs s0..s4.
+        let l = unknown_stride_program(
+            words,
+            8,
+            crate::native::ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [4, 1, 1],
+            },
+        );
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            use super::StrideEntry;
+            use super::host::{Dispatch, Root, Stride, View};
+            let cs = compute_shader(l);
+            let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
+            // Slot 2: three elements of 12 bytes; slot 3: four of 16 bytes
+            // from element 1; their raw views in slots 4 and 5.
+            let (raw_a, entry_a) = raw_view_of(2, 4, (0, 3, 12));
+            let (raw_b, entry_b) = raw_view_of(3, 5, (1, 4, 16));
+            let raw = StrideEntry {
+                stride: 4,
+                ..StrideEntry::default()
+            };
+            let table: Vec<u32> = [raw, raw, entry_a, entry_b]
+                .into_iter()
+                .flat_map(StrideEntry::words)
+                .collect();
+            // Lane `l` reads [l, 4]: of the first view dwords 1, 4, 7 and
+            // (past its three elements) nothing, of the second 5, 9, 13, 17.
+            let of_a = [101, 104, 107, 0];
+            let of_b = [205, 209, 213, 217];
+            let _one = one_at_a_time();
+            for (name, host) in hosts() {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                // The slot each of the two groups reads, in the buffer in
+                // slot 0.
+                for (slots, want) in [([2, 3], [of_a, of_b]), ([3, 2], [of_b, of_a])] {
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                                    (
+                                        1,
+                                        Root::View {
+                                            srv: true,
+                                            data: table.clone(),
+                                        },
+                                    ),
+                                ],
+                                views: &[
+                                    View::Buffer {
+                                        data: &slots,
+                                        stride: Stride::Raw,
+                                    },
+                                    View::RawUav(8),
+                                    View::Buffer {
+                                        data: &a,
+                                        stride: Stride::Structured(12),
+                                    },
+                                    View::Buffer {
+                                        data: &b,
+                                        stride: Stride::Structured(16),
+                                    },
+                                    raw_a,
+                                    raw_b,
+                                ],
+                                samplers: &[],
+                                groups: [2, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(out[0], want.concat(), "slots {slots:?} on {name}");
+                }
+            }
+        }
+    }
+
+    /// The descriptor of an unknown-stride read chosen by control flow: the
+    /// table entry read is the chosen slot's.
+    #[test]
+    fn unknown_stride_descriptor_chosen_by_control_flow() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0003, // s_cbranch_scc1 -> 0x18
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF82_0002, // s_branch -> 0x20
+            0xF408_0202,
+            0xFA00_0020, // 0x18: s_load_dwordx4 s[8:11], s[4:5], 0x20
+            0xF408_0302,
+            0xFA00_0040, // 0x20: s_load_dwordx4 s[12:15], s[4:5], 0x40
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = unknown_stride_program(words, 16, ONE_THREAD);
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            use super::StrideEntry;
+            use super::host::{Dispatch, Root, Stride, View};
+            let cs = compute_shader(l);
+            let (a, b): (Vec<u32>, Vec<u32>) = ((100..164).collect(), (200..264).collect());
+            // Slots 0 and 1: structured views of 12 and 16 bytes, their raw
+            // views in slots 3 and 4; slot 2: a raw unordered view.
+            let (raw_a, entry_a) = raw_view_of(0, 3, (0, 21, 12));
+            let (raw_b, entry_b) = raw_view_of(1, 4, (0, 16, 16));
+            let raw = StrideEntry {
+                stride: 4,
+                ..StrideEntry::default()
+            };
+            let table: Vec<u32> = [entry_a, entry_b, raw]
+                .into_iter()
+                .flat_map(StrideEntry::words)
+                .collect();
+            let _one = one_at_a_time();
+            for (name, host) in hosts() {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                // s0: 1 takes the first load, 0 the second.
+                for (s0, want) in [(1, 107), (0, 209)] {
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![s0, 0, 0, 0, 0])),
+                                    (
+                                        1,
+                                        Root::View {
+                                            srv: true,
+                                            data: table.clone(),
+                                        },
+                                    ),
+                                ],
+                                views: &[
+                                    View::Buffer {
+                                        data: &a,
+                                        stride: Stride::Structured(12),
+                                    },
+                                    View::Buffer {
+                                        data: &b,
+                                        stride: Stride::Structured(16),
+                                    },
+                                    View::RawUav(16),
+                                    raw_a,
+                                    raw_b,
+                                ],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    // Stored at [1, 8] of the raw view: stride 4, dword 3.
+                    assert_eq!(out[0][3], want, "s0 = {s0} on {name}");
+                }
+            }
+        }
+    }
+
+    /// A buffer access with a stride shader analysis recovered goes through
+    /// the same raw alias an unknown stride does. The slot may hold a view
+    /// one access made (raw or structured), so a handle of the other kind
+    /// does not name the same bytes. The program reads element 2 at byte 4
+    /// with the known stride, stores at element 1 byte 8, adds 10 twice at
+    /// element 2 byte 0, reads a non-indexed load at byte 12 and stores it
+    /// at element 0 byte 16. The view starts `first` elements into its
+    /// bytes (bias 12), so a raw access must add the bias too.
+    #[cfg(windows)]
+    fn known_stride_buffer_accesses_read_their_bytes(
+        name: &str,
+        host: &super::host::Host,
+        cs: &super::HostShader,
+        stride: u32,
+        first: u32,
+        count: u32,
+    ) {
+        use super::StrideEntry;
+        use super::host::{Dispatch, Root, Stride, View};
+        let data: Vec<u32> = (1000..1000 + (first + count) * stride / 4 + 4).collect();
+        let n = (first + count) * stride / 4;
+        let at = |index: u32, off: u32| (((first + index) * stride + off) / 4) as usize;
+        let (root, pso) = host.compute_pipeline(cs).unwrap();
+        let (raw_srv, mut srv_entry) = raw_view_of(0, 2, (first, count, stride));
+        let (raw_uav, mut uav_entry) = raw_view_of(1, 3, (first, count, stride));
+        // The slot's own view may carry another stride than the access's
+        // (a raw view's 4, another structured view's): the shader's known
+        // stride must override it, while the alias and bias are the ones the
+        // table names.
+        srv_entry.stride = 4;
+        uav_entry.stride = 4;
+        let table: Vec<u32> = [srv_entry, uav_entry]
+            .into_iter()
+            .flat_map(StrideEntry::words)
+            .collect();
+        for (kind, primary) in [
+            ("raw", Stride::Raw),
+            ("structured", Stride::Structured(stride)),
+            // Another structured stride the slot may have been made with.
+            ("structured 12", Stride::Structured(12)),
+        ] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: primary,
+                            },
+                            View::BufferUav(n, primary),
+                            raw_srv,
+                            raw_uav,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let mut want = vec![0; n as usize];
+            want[at(1, 8)] = data[at(2, 4)];
+            want[at(2, 0)] = 20;
+            want[at(0, 16)] = data[at(0, 12)];
+            assert_eq!(out[0], want, "{kind} stride {stride} on {name}");
+        }
+    }
+
+    #[test]
+    fn known_stride_buffer_accesses_use_the_raw_alias() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE030_100C,
+            0x8002_0300, // buffer_load_dword v3, v0, s[8:11], 0 offen offset:12
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0290, // v_mov_b32 v1, 16
+            0xE070_3000,
+            0x8003_0300, // buffer_store_dword v3, v[0:1], s[12:15], 0 idxen offen
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E06_028A, // v_mov_b32 v3, 10
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let cases = [(68u32, 3u32, 6u32), (2044, 1, 3)];
+        #[cfg(windows)]
+        let _one = one_at_a_time();
+        for (stride, first, count) in cases {
+            let l = table_program(
+                words,
+                &[
+                    (crate::ResourceType::Srv, 0, stride),
+                    (crate::ResourceType::Uav, 8, stride),
+                ],
+                ONE_THREAD,
+            );
+            #[cfg(not(windows))]
+            let _ = (l, first, count);
+            #[cfg(windows)]
+            {
+                let cs = compute_shader(l);
+                for (name, host) in hosts() {
+                    known_stride_buffer_accesses_read_their_bytes(
+                        name, &host, &cs, stride, first, count,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A scalar buffer load on a known-stride slot reads the raw alias too:
+    /// its address (`offset + soffset`) is bytes already, but the slot's
+    /// view may be raw or structured with another stride, and only the
+    /// alias names those bytes. The program reads `1 * 2044 + 12` by SMEM
+    /// and byte 12 by raw VMEM, from the same slot, and stores both.
+    #[cfg(windows)]
+    fn known_stride_scalar_buffer_load_reads_the_alias(
+        name: &str,
+        host: &super::host::Host,
+        cs: &super::HostShader,
+    ) {
+        use super::StrideEntry;
+        use super::host::{Dispatch, Root, Stride, View};
+        let (stride, first, count) = (2044u32, 1u32, 3u32);
+        let data: Vec<u32> = (2000..2000 + (first + count) * stride / 4 + 4).collect();
+        let (raw, mut entry) = raw_view_of(0, 2, (first, count, stride));
+        // The slot's view may be raw (stride 4) while the scalar address
+        // already names the bytes; the entry's stride must not scale it.
+        entry.stride = 4;
+        let table: Vec<u32> = entry
+            .words()
+            .into_iter()
+            .chain(StrideEntry::default().words())
+            .collect();
+        let (root, pso) = host.compute_pipeline(cs).unwrap();
+        // The slot's view may be raw, or structured with the stride the
+        // title's other accesses gave it (2048 here), not this one.
+        for (kind, primary) in [
+            ("raw", Stride::Raw),
+            ("structured 2048", Stride::Structured(2048)),
+        ] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: primary,
+                            },
+                            View::RawUav(16),
+                            raw,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let scalar = ((first + 1) * stride + 12) / 4;
+            let raw_at = (first * stride + 12) / 4;
+            assert_eq!(out[0][0], data[scalar as usize], "{kind} on {name}");
+            assert_eq!(out[0][1], data[raw_at as usize], "{kind} on {name}");
+        }
+    }
+
+    #[test]
+    fn known_stride_scalar_buffer_load_uses_the_raw_alias() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBE87_03FF,
+            0x0000_0808, // s_mov_b32 s7, 2056 (1 * 2044 + 12)
+            0xF420_0184,
+            0x0E00_0000, // s_buffer_load_dword s6, s[8:11], s7
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE030_100C,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen offset:12
+            0x7E04_0206, // v_mov_b32 v2, s6
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE070_1000,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 offen
+            0x7E00_0284, // v_mov_b32 v0, 4
+            0xE070_1000,
+            0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = table_program(
+            words,
+            &[
+                (crate::ResourceType::Srv, 0, 2044),
+                (crate::ResourceType::Uav, 8, 0),
+            ],
+            ONE_THREAD,
+        );
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            let _one = one_at_a_time();
+            let cs = compute_shader(l);
+            for (name, host) in hosts() {
+                known_stride_scalar_buffer_load_reads_the_alias(name, &host, &cs);
+            }
+        }
+    }
+
+    /// A formatted buffer load reads the format's bytes through the raw
+    /// alias as well: the format is in the instruction, so a structured or
+    /// typed view the slot may hold must not change the dwords read.
+    #[cfg(windows)]
+    fn known_stride_tbuffer_format_load_reads_the_alias(
+        name: &str,
+        host: &super::host::Host,
+        cs: &super::HostShader,
+    ) {
+        use super::StrideEntry;
+        use super::host::{Dispatch, Root, Stride, View};
+        let (stride, first, count) = (68u32, 3u32, 6u32);
+        let data: Vec<u32> = (3000..3000 + (first + count) * stride / 4 + 4).collect();
+        let (raw, mut entry) = raw_view_of(0, 2, (first, count, stride));
+        // A raw slot's stride (4) must not scale the format's byte offset.
+        entry.stride = 4;
+        let table: Vec<u32> = entry
+            .words()
+            .into_iter()
+            .chain(StrideEntry::default().words())
+            .collect();
+        let (root, pso) = host.compute_pipeline(cs).unwrap();
+        for (kind, primary) in [
+            ("raw", Stride::Raw),
+            ("structured", Stride::Structured(stride)),
+            ("structured 12", Stride::Structured(12)),
+        ] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: primary,
+                            },
+                            View::RawUav(4),
+                            raw,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let at = (first * stride + 12) / 4;
+            assert_eq!(out[0][0], data[at as usize], "{kind} on {name}");
+        }
+    }
+
+    #[test]
+    fn known_stride_tbuffer_format_load_uses_the_raw_alias() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE8B0_100C,
+            0x8002_0100, // tbuffer_load_format_x v1, v0, s[8:11], 0 offen offset:12, format 22 (32_FLOAT)
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE070_1000,
+            0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = table_program(
+            words,
+            &[
+                (crate::ResourceType::Srv, 0, 68),
+                (crate::ResourceType::Uav, 8, 0),
+            ],
+            ONE_THREAD,
+        );
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            let _one = one_at_a_time();
+            let cs = compute_shader(l);
+            for (name, host) in hosts() {
+                known_stride_tbuffer_format_load_reads_the_alias(name, &host, &cs);
+            }
+        }
+    }
+
+    #[test]
+    fn stride_entries_name_the_raw_view_and_its_bias() {
+        use super::{RawWindow, StrideEntry};
+        // No raw slot: the slot's own view, whatever the table held before.
+        assert_eq!(StrideEntry::default().words(), [0, 0]);
+        let own = StrideEntry {
+            stride: 4,
+            raw_slot: None,
+            bias: 0,
+        };
+        assert_eq!(own.words(), [4, 0]);
+        let aliased = StrideEntry {
+            stride: 12,
+            raw_slot: Some(0),
+            bias: 12,
+        };
+        assert_eq!(aliased.words(), [12, 1 | 12 << 28]);
+        // A view on 16 bytes starts its raw view; one 4 to 12 bytes past
+        // starts it early, and the raw view covers the bytes before too.
+        let window = |first, dwords, bias| {
+            Some(RawWindow {
+                first,
+                dwords,
+                bias,
+            })
+        };
+        assert_eq!(RawWindow::covering(32, 24), window(8, 6, 0));
+        assert_eq!(RawWindow::covering(36, 24), window(8, 7, 4));
+        assert_eq!(RawWindow::covering(44, 22), window(8, 9, 12));
+        assert_eq!(RawWindow::covering(0, 0), window(0, 1, 0));
+        // Off a dword: no raw view reads it.
+        assert_eq!(RawWindow::covering(34, 24), None);
+        assert_eq!(RawWindow::covering(16, 4 << 32), None);
+    }
+
     #[test]
     fn valu_div_f32_sequence_executes_on_gpu() {
         let words: &[u32] = &[
@@ -946,7 +1842,10 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        #[cfg(windows)]
         let mut dxil = l.dxil;
+        #[cfg(not(windows))]
+        let _ = l;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -955,6 +1854,7 @@ mod tests {
         }
         #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
+            let _one = one_at_a_time();
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
                 dxil,
@@ -963,6 +1863,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
+                stride_table: l.stride_table,
+                root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -971,12 +1873,30 @@ mod tests {
             .into_iter()
             .map(f32::to_bits)
             .collect();
+            // The non-indexed load reads through the raw-alias table: the
+            // views' own dwords, no alias.
+            let table: Vec<u32> = [super::StrideEntry {
+                stride: 4,
+                ..Default::default()
+            }; 2]
+            .into_iter()
+            .flat_map(super::StrideEntry::words)
+            .collect();
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &super::host::Dispatch {
-                        roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        roots: vec![
+                            (0, super::host::Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                super::host::Root::View {
+                                    srv: true,
+                                    data: table,
+                                },
+                            ),
+                        ],
                         views: &[
                             super::host::View::Buffer {
                                 data: &inputs,

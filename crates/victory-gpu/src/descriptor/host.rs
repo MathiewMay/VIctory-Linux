@@ -5,8 +5,10 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
+use victory_shader::emit::{RawWindow, StrideEntry};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -32,10 +34,39 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
-    /// Per-slot element byte stride (`u32`) for structured buffers whose
-    /// stride shader analysis could not recover statically.
+    /// Per slot, what shaders need to read a buffer whose stride shader
+    /// analysis could not recover statically ([`StrideEntry`]).
     strides: Option<StrideTable>,
+    /// The first of the [`ALIASES`] slots after the dynamic ones (view
+    /// heaps), and which slots have a raw view there.
+    alias_base: u32,
+    aliases: Mutex<Aliases>,
 }
+
+/// The raw views of the bytes structured and typed buffer views read, for
+/// shaders that read such a buffer without knowing its stride: they take a
+/// raw handle, which reads a raw view only (over the title's own view the
+/// host GPUs disagree: an RTX 5070 reads other dwords than a Radeon). The
+/// runtime stride table names the slot.
+struct Aliases {
+    /// The pool slot of each heap slot that has a raw view.
+    of: HashMap<u32, u32>,
+    /// Pool slots given back.
+    free: Vec<u32>,
+    /// Pool slots from here on were never taken.
+    next: u32,
+}
+
+/// Slots past the dynamic ones in a view heap for [`Aliases`]: one per
+/// structured or typed buffer view in the heap at a time.
+/// shortcut: a heap holding more such views at once leaves the rest without
+/// a raw view (they read zeros through the unknown-stride path, with a
+/// warning); the count is a guess, not a measured need.
+const ALIASES: u32 = 1 << 16;
+
+/// The pool's first slots: null raw views (a shader view, an unordered
+/// access one) for views that cannot have a raw view of their own.
+const NULL_ALIASES: u32 = 2;
 
 struct StrideTable {
     _resource: ID3D12Resource,
@@ -46,7 +77,7 @@ struct StrideTable {
 
 impl StrideTable {
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = (u64::from(len) * 4).max(4);
+        let bytes = (u64::from(len) * u64::from(StrideEntry::BYTES)).max(8);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -161,6 +192,7 @@ impl HostHeap {
                     })
             }
         };
+        let aliases = if sampler { 0 } else { ALIASES };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         let (heap, count, extra) = if sampler {
@@ -171,16 +203,20 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
+        } else if let Ok(heap) = make(count + DYNAMIC + aliases) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
+            match make(count + MIN_DYNAMIC + aliases) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                Err(e) if count + MIN_DYNAMIC + aliases > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC - aliases,
+                        MIN_DYNAMIC,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -200,7 +236,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(count + extra + aliases) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -220,14 +256,24 @@ impl HostHeap {
             dynamic: extra,
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
+            alias_base: count + extra,
+            aliases: Mutex::new(Aliases {
+                of: HashMap::new(),
+                free: Vec::new(),
+                next: NULL_ALIASES,
+            }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, count + extra + aliases) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+        }
+        if !sampler {
+            null_buffer_view(h.cpu(h.alias_base));
+            null_raw_uav(h.cpu(h.alias_base + 1));
         }
         tracing::debug!(
             ms = started.elapsed().as_millis(),
@@ -349,9 +395,18 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
+        self.release_with(first, n, Self::forget_view);
+    }
+
+    pub(super) fn release_with(&self, first: u32, n: u32, mut clear: impl FnMut(&Self, u32)) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        // Clear the retiring list's aliases before another list can lease
+        // these slots and publish its own stride entries.
+        for index in first..first.saturating_add(n).min(self.alias_base) {
+            clear(self, index);
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
@@ -363,12 +418,11 @@ impl HostHeap {
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make(view, self.cpu(index));
-        let ok = kept.is_some();
-        if !ok {
+        if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
-        self.set_stride(index, if ok { view_stride(view) } else { 0 });
+        let alias_kept = self.note_view(index, view, kept.as_ref());
+        self.keep(index, kept.flatten().or(alias_kept));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -379,7 +433,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, 0);
+        self.forget_view(index);
     }
 
     /// Makes slot `index` a null view matching the resource kind a shader
@@ -441,16 +495,22 @@ impl HostHeap {
         }
     }
 
-    fn set_stride(&self, index: u32, stride: u32) {
+    fn set_entry(&self, index: u32, entry: StrideEntry) {
         if let Some(t) = &self.strides
             && index < t.len
         {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of `t.len` dwords.
-            unsafe { *(t.ptr as *mut u32).add(index as usize) = stride };
+            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
+            // `t.len` entries of two dwords.
+            unsafe {
+                (t.ptr as *mut [u32; 2])
+                    .add(index as usize)
+                    .write(entry.words());
+            }
         }
     }
 
-    /// GPU virtual address of the per-slot element byte stride table.
+    /// GPU virtual address of the runtime stride table: a [`StrideEntry`]
+    /// per slot.
     pub(crate) fn stride_table_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|t| t.gpu)
     }
@@ -459,7 +519,7 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        self.set_stride(index, 0);
+        self.forget_view(index);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -479,7 +539,7 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer's host copy (a GPU
     /// page fault: #493 for reads, the same for writes through root UAVs).
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64, uav: bool) {
-        self.set_stride(index, 0);
+        self.forget_view(index);
         let Some(host) = host() else {
             self.keep(index, None);
             return;
@@ -532,7 +592,7 @@ impl HostHeap {
     /// drops writes): a root view the title did not set or that has no host
     /// copy. An unset table is undefined.
     pub(crate) fn null_raw_at(&self, index: u32, uav: bool) {
-        self.set_stride(index, 0);
+        self.forget_view(index);
         self.keep(index, None);
         if !uav {
             return null_buffer_view(self.cpu(index));
@@ -622,12 +682,16 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
-            let ok = kept.is_some();
-            if !ok && !self.sampler {
+            if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.keep(index, kept.flatten());
-            self.set_stride(index, if ok { view_stride(&view) } else { 0 });
+            let alias_kept = if later {
+                self.forget_view(index);
+                None
+            } else {
+                self.note_view(index, &view, kept.as_ref())
+            };
+            self.keep(index, kept.flatten().or(alias_kept));
         }
         Some(view)
     }
@@ -745,6 +809,297 @@ fn uav_element_size(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
     }
 }
 
+impl HostHeap {
+    /// Slot `index` was just made from `view` (`made`: what [`make`] gave):
+    /// writes its runtime stride table entry and a raw view of the same bytes.
+    /// A valid buffer may have an alias even if its primary element grid is
+    /// unrepresentable. No copied resource is introduced.
+    /// shortcut: queries and typed stores still use that primary descriptor;
+    /// if it is null they read zero/drop writes, not the aliased bytes.
+    fn note_view(&self, index: u32, view: &View, made: Option<&Kept>) -> Option<ID3D12Resource> {
+        if self.strides.is_none() {
+            return None;
+        }
+        let stride = view_stride(view);
+        let viewed = viewed_bytes(view, made.and_then(|kept| kept.as_ref()));
+        if made.is_none() && !matches!(&viewed, Viewed::Bytes { .. }) {
+            self.forget_view(index);
+            return None;
+        }
+        let mut alias_kept = None;
+        let entry = match viewed {
+            // Not a buffer view, or a raw one: the slot's own view.
+            Viewed::Own => {
+                self.unalias(index);
+                StrideEntry {
+                    stride,
+                    ..StrideEntry::default()
+                }
+            }
+            Viewed::Bytes {
+                buffer,
+                start,
+                len,
+                unordered,
+            } => {
+                let (raw_slot, bias) = self.alias(index, &buffer, start, len, unordered);
+                // The primary may be null when its element grid cannot
+                // represent this byte start. The alias still needs the
+                // exact same shadow resource kept alive in that case.
+                alias_kept = Some(buffer);
+                StrideEntry {
+                    stride,
+                    raw_slot: Some(raw_slot),
+                    bias,
+                }
+            }
+            Viewed::Unknown => {
+                once!("a buffer view whose bytes in its host copy are not found has no raw view");
+                self.unalias(index);
+                StrideEntry {
+                    stride,
+                    raw_slot: Some(self.null_alias(view_is_unordered(view))),
+                    bias: 0,
+                }
+            }
+        };
+        self.set_entry(index, entry);
+        alias_kept
+    }
+
+    /// Slot `index`'s runtime stride table entry, as shaders read it.
+    #[cfg(test)]
+    pub(crate) fn entry_words(&self, index: u32) -> [u32; 2] {
+        let t = self.strides.as_ref().expect("a view heap's table");
+        assert!(index < t.len);
+        // SAFETY: as in `set_entry`.
+        unsafe { (t.ptr as *const [u32; 2]).add(index as usize).read() }
+    }
+
+    /// The first slot of the raw view pool.
+    #[cfg(test)]
+    pub(crate) fn alias_base(&self) -> u32 {
+        self.alias_base
+    }
+
+    /// Slot `index` holds no view shaders read through the runtime stride
+    /// table: its entry is cleared and its raw view given back.
+    pub(super) fn forget_view(&self, index: u32) {
+        if self.strides.is_none() {
+            return;
+        }
+        self.unalias(index);
+        self.set_entry(index, StrideEntry::default());
+    }
+
+    /// The slot of the null raw view standing in for a raw view the host
+    /// cannot make: reads give zeros, writes are dropped.
+    fn null_alias(&self, unordered: bool) -> u32 {
+        self.alias_base + u32::from(unordered)
+    }
+
+    /// Gives back the raw view slot of `index`, if it has one.
+    fn unalias(&self, index: u32) {
+        let mut a = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = a.of.remove(&index) {
+            a.free.push(slot);
+        }
+    }
+
+    /// Makes the raw view of bytes `[start, start + len)` of `buffer` for
+    /// slot `index` (in the slot it already has for one, or a free one): the
+    /// heap slot it is in, and the bytes from its start to `start`.
+    ///
+    /// The raw view ends with the view's last element, so reads past it
+    /// give zeros and writes are dropped, as through the view itself.
+    /// shortcut: it ends on the dword holding the last byte and starts up
+    /// to 12 bytes before the first (raw views start on 16 bytes); only an
+    /// offset wrapping below the view's start reaches those bytes.
+    fn alias(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        start: u64,
+        len: u64,
+        unordered: bool,
+    ) -> (u32, u32) {
+        let Some(window) = RawWindow::covering(start, len) else {
+            // shortcut: a view starting off a dword of its host copy (an
+            // element size that is not a multiple of 4) has no raw view; a
+            // raw load could not address its bytes either.
+            once!(start, len, "a buffer view off the dwords of its host copy has no raw view");
+            self.unalias(index);
+            return (self.null_alias(unordered), 0);
+        };
+        let slot = {
+            let mut a = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = match a.of.get(&index) {
+                Some(&slot) => Some(slot),
+                None => a.free.pop().or_else(|| {
+                    (a.next < ALIASES).then(|| {
+                        a.next += 1;
+                        a.next - 1
+                    })
+                }),
+            };
+            let Some(slot) = slot else {
+                once!(
+                    "no free raw view slots: a buffer read without a known stride reads zeros"
+                );
+                return (self.null_alias(unordered), 0);
+            };
+            a.of.insert(index, slot);
+            self.alias_base + slot
+        };
+        let Some(host) = host() else {
+            return (self.null_alias(unordered), 0);
+        };
+        // SAFETY: the live shared shadow covers this bounded byte range;
+        // the raw descriptor is another view, not another resource.
+        unsafe {
+            if unordered {
+                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: window.first,
+                            NumElements: window.dwords,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                };
+                host.device.CreateUnorderedAccessView(
+                    buffer,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    self.cpu(slot),
+                );
+            } else {
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: window.first,
+                            NumElements: window.dwords,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                host.device
+                    .CreateShaderResourceView(buffer, Some(&desc), self.cpu(slot));
+            }
+        }
+        (slot, window.bias)
+    }
+}
+
+/// What a view the host made reads, for its raw view.
+enum Viewed {
+    /// Not a buffer, or through a raw view already.
+    Own,
+    /// These bytes of this host buffer (the view's own), read or also
+    /// written.
+    Bytes {
+        buffer: ID3D12Resource,
+        start: u64,
+        len: u64,
+        unordered: bool,
+    },
+    /// A structured or typed buffer view whose host buffer is not the one
+    /// the bytes are found in now.
+    Unknown,
+}
+
+/// Whether `view` is for unordered access.
+fn view_is_unordered(view: &View) -> bool {
+    matches!(view, View::Unordered(..) | View::Placed(true, ..))
+}
+
+/// The bytes of its host copy the structured or typed buffer view `view`
+/// reads, from the first element's byte in the copy for the view's length.
+/// `kept`, when present, must be the same resource the shadow resolves to.
+fn viewed_bytes(view: &View, kept: Option<&ID3D12Resource>) -> Viewed {
+    use windows::core::Interface;
+    const BUFFER: u32 = 1;
+    // The title buffer's address and length, and the view's description.
+    let (base, len, words, unordered): (u64, u64, &[u32; 10], bool) = match view {
+        View::Shader(r, Some(desc)) | View::Unordered(r, _, Some(desc)) => {
+            let r = *r as crate::object::This;
+            if crate::resource::host_resource(r).is_some() {
+                return Viewed::Own;
+            }
+            let Some((data, len)) = crate::resource::buffer_bytes(r) else {
+                return Viewed::Own;
+            };
+            (data as u64, len, desc, view_is_unordered(view))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER => {
+            let Ok(words) = desc[..10].try_into() else {
+                return Viewed::Own;
+            };
+            (
+                u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                u64::from(resource[4]) | u64::from(resource[5]) << 32,
+                words,
+                *unordered,
+            )
+        }
+        _ => return Viewed::Own,
+    };
+    // (first element, elements, bytes per element), none for a raw view.
+    let elements = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0)
+            .then(|| (b.FirstElement, b.NumElements, uav_element_size(&desc).unwrap_or(0)))
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
+            .then(|| (b.FirstElement, b.NumElements, element_size(&desc)))
+    };
+    let Some((first, count, element)) = elements else {
+        return Viewed::Own;
+    };
+    let Some(shadow) = crate::shadow::find(base, len) else {
+        return Viewed::Unknown;
+    };
+    if element == 0 || kept.is_some_and(|kept| shadow.buffer.as_raw() != kept.as_raw()) {
+        return Viewed::Unknown;
+    }
+    if unordered {
+        // A refused primary UAV must not bypass the resource's write flag.
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            return Viewed::Unknown;
+        }
+    }
+    let Some(first_byte) = first.checked_mul(element) else { return Viewed::Unknown };
+    let available = len.min(shadow.left(base));
+    let Some(remaining) = available.checked_sub(first_byte) else { return Viewed::Unknown };
+    let bytes = if count == 0 {
+        remaining
+    } else {
+        (u64::from(count) * element).min(remaining)
+    };
+    if bytes == 0 {
+        return Viewed::Unknown;
+    }
+    Viewed::Bytes {
+        buffer: shadow.buffer.clone(),
+        start: shadow.offset(base) + first_byte,
+        len: bytes,
+        unordered,
+    }
+}
+
 /// Element byte stride of `view` for the runtime stride table (`0` for
 /// non-buffer views or descriptors without a known element size).
 fn view_stride(view: &View) -> u32 {
@@ -805,6 +1160,19 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
     Some((start / 4, u32::try_from(dwords).ok()?))
 }
 
+/// Clamp a final descriptor (whose FirstElement is already relative to the
+/// host copy) to the logical title buffer's end. Raw fallbacks use dwords.
+fn bounded_view_count(first: u64, count: u32, element: u64, end: u64) -> Option<u32> {
+    if element == 0 {
+        return None;
+    }
+    let start = first.checked_mul(element)?;
+    let remaining = end.checked_sub(start)? / element;
+    let remaining = remaining.min(u64::from(u32::MAX)) as u32;
+    let count = if count == 0 { remaining } else { count.min(remaining) };
+    (count > 0).then_some(count)
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -847,6 +1215,20 @@ fn buffer_srv(
         );
         return None;
     }
+    // FirstElement was already adjusted above, possibly into raw dwords.
+    // Clamp using the final descriptor's element size, not the old stride.
+    let storage_element = if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        element
+    };
+    let end = offset.checked_add(len.min(shadow.left(address)))?;
+    buffer.NumElements = bounded_view_count(
+        buffer.FirstElement,
+        buffer.NumElements,
+        storage_element,
+        end,
+    )?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -912,6 +1294,18 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
+    let storage_element = if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        element
+    };
+    let end = offset.checked_add(len.min(shadow.left(address)))?;
+    buffer.NumElements = bounded_view_count(
+        buffer.FirstElement,
+        buffer.NumElements,
+        storage_element,
+        end,
+    )?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1228,6 +1622,32 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// A raw unordered access view of a buffer that drops writes and reads
+/// zeros.
+fn null_raw_uav(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+}
+
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -1281,6 +1701,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn final_view_count_uses_adjusted_first_element_and_final_stride() {
+        // Four 32-byte elements start 16 bytes into the copy. After the
+        // raw fallback this is first dword 4, not a 32-byte element index.
+        assert_eq!(super::bounded_view_count(4, 32, 4, 144), Some(32));
+        assert_eq!(super::bounded_view_count(4, 1000, 4, 144), Some(32));
+        assert_eq!(super::bounded_view_count(4, 0, 4, 144), Some(32));
+        assert_eq!(super::bounded_view_count(3, 10, 12, 72), Some(3));
+        assert_eq!(super::bounded_view_count(4, 1, 4, 16), None);
+        assert_eq!(super::bounded_view_count(0, 1, 0, 16), None);
+        assert_eq!(super::bounded_view_count(u64::MAX, 1, 4, 16), None);
+    }
+
     use super::*;
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
@@ -1401,14 +1834,48 @@ void main(uint3 id : SV_DispatchThreadID) {
         .unwrap();
         let code = code.unwrap();
         let device = &host.device;
-        // SAFETY: the blob's own bytes, with the root signature inside;
-        // plain object creation.
+        // Wine's D3DCompile may omit the embedded root signature. Serialize
+        // the same table independently, as production indirect shaders do.
         let (root, pso, views, step) = unsafe {
             let bytes = std::slice::from_raw_parts(
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let ranges = [
+                D3D12_DESCRIPTOR_RANGE {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    NumDescriptors: 1,
+                    OffsetInDescriptorsFromTableStart: 0,
+                    ..Default::default()
+                },
+                D3D12_DESCRIPTOR_RANGE {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 2,
+                    OffsetInDescriptorsFromTableStart: 1,
+                    ..Default::default()
+                },
+            ];
+            let parameter = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &parameter,
+                ..Default::default()
+            };
+            let mut signature = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut signature, None).unwrap();
+            let signature = signature.unwrap();
+            let root: ID3D12RootSignature = device.CreateRootSignature(0,
+                std::slice::from_raw_parts(signature.GetBufferPointer().cast::<u8>(), signature.GetBufferSize())
+            ).unwrap();
             let pso: ID3D12PipelineState = device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),

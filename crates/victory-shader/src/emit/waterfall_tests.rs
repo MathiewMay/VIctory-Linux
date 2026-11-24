@@ -82,6 +82,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        stride_table: lowered.stride_table,
+        root_uavs: lowered.root_uavs,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -112,6 +114,60 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A shader reading heap buffer data through the runtime stride table
+    // needs it bound. Each structured buffer view gets a raw alias of its
+    // own buffer (not a second copy), starting on the first element (bias
+    // 0), and the table names that alias for the view's slot. The heap
+    // keeps the caller's views first, so the alias indices follow them.
+    let mut heap: Vec<View> = views.to_vec();
+    let mut entries = Vec::new();
+    if shader.stride_table {
+        for (i, view) in views.iter().enumerate() {
+            let entry = match *view {
+                View::Buffer {
+                    data,
+                    stride: Stride::Structured(s),
+                } => {
+                    // The view's own bytes (elements it has, times the
+                    // stride), from the same buffer; bias 0 as it starts on
+                    // element 0.
+                    let elements = data.len() * 4 / s as usize;
+                    let window = super::RawWindow::covering(0, (elements * s as usize) as u64)
+                        .expect("a structured view's bytes");
+                    let raw_slot = heap.len() as u32;
+                    heap.push(View::RawAlias {
+                        of: i,
+                        first: window.first as u32,
+                        dwords: window.dwords,
+                    });
+                    super::StrideEntry {
+                        stride: s,
+                        raw_slot: Some(raw_slot),
+                        bias: window.bias,
+                    }
+                }
+                View::Buffer {
+                    stride: Stride::Raw,
+                    ..
+                }
+                | View::BufferUav(_, Stride::Raw)
+                | View::RawUav(_) => super::StrideEntry {
+                    stride: 4,
+                    ..Default::default()
+                },
+                _ => super::StrideEntry::default(),
+            };
+            entries.extend(entry.words());
+        }
+        // The alias slots follow the caller's views in the heap; a default
+        // entry for each keeps the table as long as the heap (their own raw
+        // views, no alias), as the host's table is.
+        for _ in views.len()..heap.len() {
+            entries.extend(super::StrideEntry::default().words());
+        }
+    }
+    let stride_param =
+        1 + (shader.root_cbvs.len() + shader.root_srvs.len() + shader.root_uavs.len()) as u32;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -127,13 +183,23 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.stride_table {
+            roots.push((
+                stride_param,
+                Root::View {
+                    srv: true,
+                    data: entries.clone(),
+                },
+            ));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views,
+                    roots,
+                    views: &heap,
                     samplers: &samplers,
                     groups: [1, 1, 1],
                 },
